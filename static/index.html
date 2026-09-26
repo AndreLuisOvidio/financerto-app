@@ -2904,6 +2904,7 @@ const TRADUCOES = {"en": {
 "Calendário": "Calendar",
 "Cancelar": "Cancel",
 "Carregando...": "Loading...",
+"Cartão de crédito ligado a uma conta, não importado: {0}. Ligue em Cartões, ou marque para ignorar.": "Credit card linked to an account, not imported: {0}. Link it in Cards, or mark it to be ignored.",
 "Cartão perto do limite": "Card near the limit",
 "Cartões": "Cards",
 "Cartões de crédito": "Credit cards",
@@ -2962,6 +2963,7 @@ const TRADUCOES = {"en": {
 "Despesa": "Expense",
 "Despesas": "Expenses",
 "Despesas do mês": "Expenses this month",
+"Diferença grande é sinal de extrato incompleto, não de conta errada.": "A big difference is a sign of an incomplete statement, not of the wrong account.",
 "Dia de vencimento": "Due day",
 "Digite para procurar em todos os meses.": "Type to search across every month.",
 "Digite pra buscar (ex: petrobras, bitcoin)": "Type to search (e.g. petrobras, bitcoin)",
@@ -3168,6 +3170,7 @@ const TRADUCOES = {"en": {
 "Recolher menu": "Collapse menu",
 "Referência": "Reference",
 "Referência não identificada": "Reference not identified",
+"Reler as contas deste banco": "Re-read this bank's accounts",
 "Registrar compra": "Record purchase",
 "Registrar provento": "Record income",
 "Regras": "Rules",
@@ -3238,6 +3241,7 @@ const TRADUCOES = {"en": {
 "Salvar categoria": "Save category",
 "Salvar configuração": "Save settings",
 "Salvar nova senha": "Save new password",
+"Saldo inicial ajustado para bater com o banco:": "Starting balance adjusted to match the bank:",
 "Selecione": "Select",
 "Sem conta": "No account",
 "Sem conta vinculada": "No linked account",
@@ -3254,6 +3258,10 @@ const TRADUCOES = {"en": {
 "Sua conta": "Your account",
 "Suas despesas do mês ({0}) já passam a renda ({1}) em {2}. Nesse ritmo o mês fecha negativo — vale rever o que dá pra cortar ou adiar antes de virar dívida.": "Your expenses this month ({0}) already exceed your income ({1}) by {2}. At this pace the month closes negative — worth reviewing what can be cut or postponed before it becomes debt.",
 "Só o administrador (primeiro usuário criado) vê e altera isso. Quando ligado, a aba Empréstimos aparece pra todos os usuários.": "Only the administrator (the first user created) sees and changes this. When on, the Loans tab appears for every user.",
+"Sincronizando...": "Syncing...",
+"Sincronizei {0} conta(s) e {1} lançamento(s) novo(s).": "Synced {0} account(s) and {1} new entry/entries.",
+"Sincronizar agora": "Sync now",
+"Também {0} compra(s) de cartão.": "Also {0} card purchase(s).",
 "Taxa (ex: 110 ou 6)": "Rate (e.g. 110 or 6)",
 "Tendência (últimos 6 meses)": "Trend (last 6 months)",
 "Tesouro IPCA+": "Tesouro IPCA+",
@@ -3286,6 +3294,7 @@ const TRADUCOES = {"en": {
 "Trocar senha": "Change password",
 "Trocar senha de": "Change password for",
 "Usuário (login)": "Username",
+"Última sincronização:": "Last sync:",
 "Valor (R$)": "Amount (R$)",
 "Valor alvo (R$)": "Target amount (R$)",
 "Valor bruto anunciado (R$)": "Gross amount announced (R$)",
@@ -3324,6 +3333,7 @@ const TRADUCOES = {"en": {
 "dias": "days",
 "do banco": "from the bank",
 "do banco. Por isso não dá para editar aqui — se editasse, o saldo do app deixaria de bater com o do banco.": "from the bank. That is why it cannot be edited here — if it were, the app balance would stop matching the bank.",
+"do cartão": "from the card",
 "do limite.": "of the limit.",
 "em aberto": "open",
 "em dia": "up to date",
@@ -4623,14 +4633,15 @@ function renderizarNaoCat(){
             ? " · de " + formatData(g.primeira) + " a " + formatData(g.ultima)
             : (g.ultima ? " · " + formatData(g.ultima) : "")}
           ${g.do_banco ? " · " + t("do banco") : ""}
+          ${g.do_cartao ? " · " + t("do cartão") : ""}
         </span>
       </div>
       <div class="grupo-nc-form">
         <select id="gnc-cat-${i}">
           <option value="">${t("Escolha a categoria...")}</option>
           ${opcoesCategoria(g.tipo === "renda" ? "receita" : "despesa")}
-          <option value="__transf__">${t("— é transferência entre contas —")}</option>
-          <option value="__fora__">${t("— não contar nos totais —")}</option>
+          ${g.da_conta ? `<option value="__transf__">${t("— é transferência entre contas —")}</option>
+          <option value="__fora__">${t("— não contar nos totais —")}</option>` : ""}
         </select>
         <label class="grupo-nc-regra">
           <input type="checkbox" id="gnc-regra-${i}" checked>
@@ -4881,8 +4892,18 @@ async function aplicarRegrasHistorico(){
 }
 
 // ---------- Open Finance (Pluggy) ----------
+// Mesma regra do servidor (app.py, eh_cartao_pluggy): CREDIT na Pluggy é
+// cartão de crédito, e o `balance` dele é a fatura em aberto.
+function ehCartaoPluggy(c){
+  const tipo = String(c.tipo || "").toUpperCase();
+  const subtipo = String(c.subtipo || "").toUpperCase();
+  return subtipo.includes("CREDIT_CARD") || (tipo === "CREDIT" && subtipo.includes("CARD"))
+      || tipo === "CREDIT";
+}
+
 let ofCredCache = null;
 let ofItensCache = [];
+let ofSyncUltimo = null;
 
 async function carregarOpenFinance(){
   try {
@@ -4959,6 +4980,7 @@ function renderizarOpenFinance(){
     `<option value="conta:${c.id}">${escapeHtml(c.nome)}</option>`).join("");
   const opcoesCartao = cartoesCache.map(c =>
     `<option value="cartao:${c.id}">${escapeHtml(c.nome)} (cartão)</option>`).join("");
+  const temCartao = id => cartoesCache.some(c => c.id === id);
 
   elCon.innerHTML = ofItensCache.map(it => {
     const problema = it.status && it.status !== "UPDATED";
@@ -4966,6 +4988,18 @@ function renderizarOpenFinance(){
       const atual = c.conta_id ? `conta:${c.conta_id}`
                   : c.cartao_id ? `cartao:${c.cartao_id}`
                   : c.ignorada ? "ignorar" : "";
+      // Cartão de crédito não aparece na lista de contas: o saldo que a Pluggy
+      // devolve para ele é a fatura em aberto, e uma conta que "tem" a fatura
+      // mente sobre o dinheiro que existe. O servidor também recusa o vínculo.
+      const cartao = ehCartaoPluggy(c);
+      // A lista de cartões é a do próprio usuário, então o cartão de outro
+      // membro da casa já ligado não estaria na lista — e o seletor cairia
+      // em "não usar ainda", parecendo que nada foi vinculado. Ele não entra
+      // na oferta de escolha; aparecer é o mínimo para o vínculo ser visível.
+      const jaLigado = c.cartao_id && !temCartao(c.cartao_id)
+        ? `<option value="cartao:${c.cartao_id}">${escapeHtml(c.cartao_nome || `cartão ${c.cartao_id}`)} (cartão)</option>`
+        : "";
+      const opcoes = (jaLigado + (cartao ? opcoesCartao : opcoesConta + opcoesCartao));
       return `<div class="of-conta">
           <div>
             <div class="of-conta-nome">${escapeHtml(c.nome || "conta")}</div>
@@ -4974,7 +5008,7 @@ function renderizarOpenFinance(){
           </div>
           <select onchange="vincularContaOF(${c.id}, this.value)">
             <option value=""${atual===""?" selected":""}>${t("— não usar ainda —")}</option>
-            ${opcoesConta}${opcoesCartao}
+            ${opcoes}
             <option value="ignorar"${atual==="ignorar"?" selected":""}>${t("Ignorar esta conta")}</option>
           </select>
         </div>`;
@@ -4987,7 +5021,7 @@ function renderizarOpenFinance(){
           <div class="of-cartao-acoes">
             <button class="icon" type="button" data-item="${escapeHtml(it.item_id)}"
                     onclick="sincronizarItemOF(this.dataset.item)"
-                    title="Sincronizar">${ICO.restaurar || ICO.repetir || "↻"}</button>
+                    title="${t("Reler as contas deste banco")}">${ICO.restaurar || ICO.repetir || "↻"}</button>
             <button class="icon danger" type="button" data-item="${escapeHtml(it.item_id)}"
                     onclick="removerItemOF(this.dataset.item)"
                     title="Remover conexão">${ICO.x}</button>
@@ -4998,10 +5032,12 @@ function renderizarOpenFinance(){
   }).join("") + `<div class="of-aviso">
       ${t("Remover a conexão apaga só o vínculo aqui. Para")} <b>${t("revogar de verdade")}</b>
       ${t("o compartilhamento, use o aplicativo do seu banco — é lá que o consentimento vive.")}
-      <div style="margin-top:9px;">
+      <div style="margin-top:9px; display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+        <button type="button" id="ofSyncBtn" onclick="sincronizarTudoOF()">${ICO.repetir} ${t("Sincronizar agora")}</button>
         <button type="button" class="secondary" onclick="ativarWebhookOF()">${t("Ativar avisos na hora")}</button>
         <span id="ofWebhookEstado" style="margin-left:8px;"></span>
       </div>
+      <div id="ofSyncResumo" class="of-aviso"></div>
     </div>`;
 
   // Marca a opção certa em cada select depois de montar (o selected inline não
@@ -5013,6 +5049,7 @@ function renderizarOpenFinance(){
     const sel = elCon.querySelector(`select[onchange*="vincularContaOF(${c.id},"]`);
     if (sel) sel.value = valor;
   }));
+  pintarResumoOF();
 }
 
 // Sem webhook a novidade aparece no ciclo diário; com ele, em minutos. Exige
@@ -5069,6 +5106,69 @@ async function conectarItemOF(ev){
     document.getElementById("ofItemId").value = "";
     await carregarOpenFinance();
   } catch (e) {}
+}
+
+// O ↻ do banco é só uma coisa: reler a lista de contas. O extrato e o ajuste
+// de saldo são do ciclo (/pluggy/sincronizar), que sem webhook só roda uma vez
+// por dia — 24h depois de o app subir, o que na prática é nunca na hora em que
+// a pessoa conecta. Este botão é o atalho para não esperar.
+async function sincronizarTudoOF(){
+  const btn = document.getElementById("ofSyncBtn");
+  if (btn){
+    btn.disabled = true;
+    btn.innerHTML = `${ICO.repetir} ${t("Sincronizando...")}`;
+  }
+  try {
+    const res = await apiFetch(`${API}/pluggy/sincronizar`, {method:"POST"},
+                               {erro:"Não foi possível sincronizar com o banco"});
+    const r = await res.json();
+    if (r && r.erro) throw new Error(r.erro);
+    ofSyncUltimo = Object.assign({}, r, {em: new Date().toISOString()});
+    showToast(resumoOF(ofSyncUltimo), "ok");
+    // O extrato vira lançamento e mexe no saldo inicial: o resto da tela está
+    // velho depois disso, e mostrar número desatualizado seria pior que nada.
+    await carregarTudo();
+  } catch (e) {
+    if (btn){
+      btn.disabled = false;
+      btn.innerHTML = `${ICO.repetir} ${t("Sincronizar agora")}`;
+    }
+  }
+}
+
+function resumoOF(r){
+  const base = tf("Sincronizei {0} conta(s) e {1} lançamento(s) novo(s).",
+                  r.contas || 0, r.criadas || 0);
+  return r.compras ? `${base} ${tf("Também {0} compra(s) de cartão.", r.compras)}` : base;
+}
+
+// Fica em variável, e não no HTML: renderizarOpenFinance() redesenha a seção
+// inteira a cada carregarOpenFinance(), e o resultado da sincronização some
+// junto se morar dentro dela.
+function pintarResumoOF(){
+  const el = document.getElementById("ofSyncResumo");
+  if (!el) return;
+  if (!ofSyncUltimo){ el.innerHTML = ""; return; }
+  const r = ofSyncUltimo;
+  let html = `<div>${escapeHtml(resumoOF(r))}</div>`
+          + `<div style="margin-top:3px; opacity:.8;">${t("Última sincronização:")} `
+          + `${escapeHtml(tempoDesde(r.em))}</div>`;
+  const des = Object.entries(r.descompasso || {});
+  if (des.length){
+    html += `<div style="margin-top:5px;">${t("Saldo inicial ajustado para bater com o banco:")} `
+          + des.map(([nome, v]) => `${escapeHtml(nome)} — ${formatMoeda(v)}`).join(", ")
+          + `</div><div style="margin-top:3px; opacity:.8;">`
+          + t("Diferença grande é sinal de extrato incompleto, não de conta errada.")
+          + `</div>`;
+  }
+  // Cartão apontado para uma conta é o erro que faz a fatura virar saldo: o
+  // servidor deixa de importar, mas só o aviso diz o que arrumar.
+  if (r.cartoes_como_conta && r.cartoes_como_conta.length){
+    html += `<div style="margin-top:5px; color:var(--yellow);">`
+          + t("Cartão de crédito ligado a uma conta, não importado: {0}. Ligue em Cartões, ou marque para ignorar.", r.cartoes_como_conta.join(", "))
+          + `</div>`;
+  }
+  el.innerHTML = html;
 }
 
 async function sincronizarItemOF(itemId){

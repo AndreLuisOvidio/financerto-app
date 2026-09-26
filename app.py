@@ -272,6 +272,10 @@ MENSAGENS_EN = {
     "esse cartão não é desta casa": "that card does not belong to this household",
     "escolha uma conta ou um cartão, não os dois":
         "choose an account or a card, not both",
+    "isso é um cartão de crédito: ele entra em Cartões, não em Contas. "
+    "O saldo dele é a fatura em aberto, não dinheiro na conta.":
+        "that's a credit card: it belongs in Cards, not Accounts. "
+        "Its balance is the open invoice, not money in the account.",
     "essa conta é sincronizada pelo Open Finance — o saldo inicial é calculado a partir do extrato":
         "this account is synced through Open Finance — the starting balance is calculated from the statement",
     "o modo demonstração não conecta em banco de verdade":
@@ -286,6 +290,8 @@ MENSAGENS_EN = {
         "enter a name, a category and at least one condition",
     "nenhum desses lançamentos é desta casa":
         "none of those entries belong to this household",
+    "compra de cartão só aceita categoria":
+        "a card purchase only takes a category",
     "desligue o modo demonstração antes de restaurar":
         "turn demo mode off before restoring",
 }
@@ -6291,6 +6297,21 @@ def pluggy_remover_item(item_id):
         conn.close()
 
 
+def eh_cartao_pluggy(linha):
+    """Diz se uma conta da Pluggy é cartão de crédito.
+
+    `tipo` é CREDIT para cartão de crédito; `subtipo` confirma com
+    CREDIT_CARD. Os dois são conferidos porque linha mais antiga pode ter
+    ficado sem subtipo — e cartão perdido no meio vira conta, que é o erro
+    mais caro que existe aqui: some com a dívida e inventa despesa.
+    """
+    if not linha:
+        return False
+    subtipo = (linha["subtipo"] or "").upper()
+    tipo = (linha["tipo"] or "").upper()
+    return "CREDIT_CARD" in subtipo or (tipo == "CREDIT" and "CARD" in subtipo) or tipo == "CREDIT"
+
+
 @app.route("/api/pluggy/contas/<int:item_id>/vinculo", methods=["PUT"])
 def pluggy_vincular_conta(item_id):
     """Liga uma conta da Pluggy a uma conta ou cartão do FinanCerto — ou marca
@@ -6299,7 +6320,7 @@ def pluggy_vincular_conta(item_id):
     try:
         casa_id = minha_casa_id(conn)
         linha = conn.execute(
-            "SELECT casa_id FROM pluggy_contas WHERE id = ?", (item_id,)
+            "SELECT casa_id, tipo, subtipo FROM pluggy_contas WHERE id = ?", (item_id,)
         ).fetchone()
         if not linha or linha["casa_id"] != casa_id:
             return jsonify({"erro": msg("conta não encontrada nesta casa")}), 404
@@ -6311,6 +6332,16 @@ def pluggy_vincular_conta(item_id):
 
         if conta_id and cartao_id:
             return jsonify({"erro": msg("escolha uma conta ou um cartão, não os dois")}), 400
+
+        # Cartão de crédito não é conta. O `balance` que a Pluggy devolve para
+        # ele é a FATURA em aberto — um passivo — e não dinheiro na conta: se
+        # ele entrar pelo ramo de conta, a recalibração de saldo_inicial
+        # forçaria a conta a "ter" a dívida e as compras parceladas virariam
+        # despesa de uma conta que nunca as pagou. Cartão tem subtipo próprio.
+        if conta_id and eh_cartao_pluggy(linha):
+            return jsonify({"erro": msg(
+                "isso é um cartão de crédito: ele entra em Cartões, não em Contas. "
+                "O saldo dele é a fatura em aberto, não dinheiro na conta.")}), 400
 
         # O alvo tem que ser da mesma casa, senão o extrato de um cairia no
         # financeiro de outro.
@@ -6765,6 +6796,13 @@ def pluggy_sincronizar_tudo(conn, casa_id, criar=True):
         "SELECT * FROM pluggy_contas WHERE casa_id = ? AND conta_id IS NOT NULL AND ignorada = 0",
         (casa_id,),
     ).fetchall():
+        # Vínculo antigo, de antes do servidor recusar: um cartão de crédito
+        # apontado para uma conta. Importar por aqui transformaria a fatura em
+        # despesa e a recalibração abaixo inflaria o saldo da conta para o
+        # valor da dívida. Melhor não importar e dizer o que arrumar.
+        if eh_cartao_pluggy(pc):
+            resumo.setdefault("cartoes_como_conta", []).append(pc["nome"])
+            continue
         try:
             rel = pluggy_importar_conta(conn, casa_id, pc, criar=criar)
         except PluggyErro:
@@ -6906,11 +6944,22 @@ def pluggy_importar_cartao(conn, casa_id, pluggy_conta, criar=True):
         tipo = "pagamento" if pluggy_tipo == "CREDIT" else "compra"
         valor = abs(t.get("amount") or 0)
         data = (t.get("date") or "")[:10]
+        descricao = (t.get("description") or "Sem descrição").strip()
 
         # Categoria só faz sentido em compra: rotular um pagamento de fatura
         # como "Fatura de cartão" dentro do próprio cartão seria circular.
-        categoria = None if tipo == "pagamento" else categoria_do_pluggy(
-            t.get("category"), "despesa")
+        if tipo == "pagamento":
+            categoria = None
+        else:
+            # Regra primeiro, exatamente como no extrato bancário: é na
+            # descrição que está o nome do estabelecimento, e a categoria da
+            # Pluggy é genérica. Sem esta linha a mesma regra que resolve
+            # "UBER" na conta não resolveria no cartão, e a compra voltaria
+            # sem categoria — a pessoa classify a mão o que a regra já sabe.
+            categoria, transf_regra, fora_regra, _ = aplicar_regras(
+                conn, casa_id, descricao, valor, "despesa")
+            if not categoria:
+                categoria = categoria_do_pluggy(t.get("category"), "despesa")
 
         parcela_num = cc.get("installmentNumber")
         parcela_total = cc.get("totalInstallments")
@@ -6924,7 +6973,7 @@ def pluggy_importar_cartao(conn, casa_id, pluggy_conta, criar=True):
                    (cartao_id, descricao, valor, data, categoria, usuario_id, criado_em,
                     transacao_id, origem, parcela_num, parcela_total, fatura_mes, tipo)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open_finance', ?, ?, ?, ?)""",
-            (cartao_id, (t.get("description") or "Sem descrição").strip(), valor, data,
+            (cartao_id, descricao, valor, data,
              categoria, usuario_id, datetime.now().isoformat(), transacao_id,
              parcela_num if isinstance(parcela_num, int) else None,
              parcela_total if isinstance(parcela_total, int) else None,
@@ -7560,8 +7609,32 @@ def aplicar_regras_no_historico():
                 (nova_cat, int(transf), nova_fora, l["id"]),
             )
             mudados += 1
+
+        # Compra de cartão entra aqui também. Sem isso as regras serviam para
+        # o extrato da conta e não para a fatura do mesmo cartão — a pessoa
+        # escrevia a mesma regra duas vezes, uma para cada lugar.
+        compras = conn.execute(
+            """SELECT ct.id, ct.descricao, ct.valor, ct.categoria
+               FROM cartao_transacoes ct JOIN usuarios u ON u.id = ct.usuario_id
+               WHERE u.casa_id = ? AND ct.tipo = 'compra'""",
+            (casa_id,),
+        ).fetchall()
+        for ct in compras:
+            categoria, _transf, _fora, regra_id = aplicar_regras(
+                conn, casa_id, ct["descricao"], ct["valor"], "despesa")
+            if not regra_id or not categoria:
+                continue
+            if ct["categoria"] and not sobrescrever:
+                continue
+            if categoria == ct["categoria"]:
+                continue
+            conn.execute("UPDATE cartao_transacoes SET categoria = ? WHERE id = ?",
+                         (categoria, ct["id"]))
+            mudados += 1
+
         conn.commit()
-        return jsonify({"ok": True, "avaliados": len(alvo), "classificados": mudados})
+        return jsonify({"ok": True, "avaliados": len(alvo) + len(compras),
+                        "classificados": mudados})
     finally:
         conn.close()
 
@@ -7615,18 +7688,41 @@ def sugerir_condicao_regra(descricao):
 
 @app.route("/api/nao-categorizados", methods=["GET"])
 def listar_nao_categorizados():
-    """Grupos de lançamentos sem categoria, do mais frequente para o menos."""
+    """Grupos de lançamentos sem categoria, do mais frequente para o menos.
+
+    Lê também as compras do cartão: elas moram em `cartao_transacoes`, não em
+    `lancamentos`, e deixá-las de fora fazia o trabalho de classificação
+    sumir justo depois de o cartão ser ligado — a pessoa veria "nada pendente"
+    com a fatura cheia de compra sem categoria. O id vem prefixado com `c:`
+    justamente para o POST saber de qual tabela é.
+
+    Fica de fora quem já foi decidido que não conta: marcado como fora dos
+    totais não tem categoria por definição, e pedir categoria para ele era
+    pedir a mesma coisa toda vez, sem nunca resolver.
+    """
     conn = get_db()
     try:
         casa_id = minha_casa_id(conn)
         linhas = conn.execute(
             """SELECT l.id, l.descricao, l.valor, l.tipo,
                       COALESCE(l.data_pagamento, l.vencimento, l.mes) AS quando,
-                      l.conta, l.origem
+                      l.conta, l.origem, 0 AS do_cartao
                FROM lancamentos l JOIN usuarios u ON u.id = l.usuario_id
                WHERE u.casa_id = ? AND l.eh_transferencia = 0
+                 AND l.fora_dos_totais = 0
                  AND (l.categoria IS NULL OR l.categoria = '')
                ORDER BY quando DESC""",
+            (casa_id,),
+        ).fetchall()
+        linhas += conn.execute(
+            """SELECT ct.id, ct.descricao, ct.valor, 'compra' AS tipo, ct.data AS quando,
+                      ca.nome AS conta, ct.origem, 1 AS do_cartao
+               FROM cartao_transacoes ct
+               JOIN cartoes ca ON ca.id = ct.cartao_id
+               JOIN usuarios u ON u.id = ct.usuario_id
+               WHERE u.casa_id = ? AND (ct.categoria IS NULL OR ct.categoria = '')
+                 AND ct.tipo = 'compra'
+               ORDER BY ct.data DESC""",
             (casa_id,),
         ).fetchall()
 
@@ -7644,10 +7740,16 @@ def listar_nao_categorizados():
                 "ids": [],
                 "sugestao": sugerir_condicao_regra(l["descricao"]),
                 "do_banco": False,
+                "do_cartao": False,
+                "da_conta": False,
             })
             g["quantidade"] += 1
             g["total"] += l["valor"] or 0
-            g["ids"].append(l["id"])
+            g["ids"].append(f"c:{l['id']}" if l["do_cartao"] else l["id"])
+            if l["do_cartao"]:
+                g["do_cartao"] = True
+            else:
+                g["da_conta"] = True
             if l["quando"] and (not g["primeira"] or l["quando"] < g["primeira"]):
                 g["primeira"] = l["quando"]
             if l["quando"] and (not g["ultima"] or l["quando"] > g["ultima"]):
@@ -7664,7 +7766,14 @@ def listar_nao_categorizados():
 
 @app.route("/api/nao-categorizados/classificar", methods=["POST"])
 def classificar_nao_categorizados():
-    """Classifica um grupo inteiro e, se pedido, cria a regra para o futuro."""
+    """Classifica um grupo inteiro e, se pedido, cria a regra para o futuro.
+
+    O grupo pode vir misturado: a mesma descrição pode existir no extrato da
+    conta e na fatura do cartão. Por isso o id carrega a tabela — `c:12` é
+    compra de cartão, `12` é lançamento. Compra de cartão não vira
+    transferência nem "fora dos totais": esses dois conceitos são de conta,
+    e um pagamento de fatura já entra no extrato bancário como despesa.
+    """
     dados = request.get_json(silent=True) or {}
     ids = dados.get("ids") or []
     categoria = (dados.get("categoria") or "").strip()
@@ -7678,23 +7787,77 @@ def classificar_nao_categorizados():
     if not categoria and not transferencia and not fora_dos_totais:
         return jsonify({"erro": msg("escolha uma categoria, ou marque como transferência ou fora dos totais")}), 400
 
+    ids_cartao, ids_lancamento = [], []
+    for bruto in ids:
+        # Aceita string e número: o id chega como número do lançamento e como
+        # "c:12" da compra de cartão, e um id de cliente não pode virar SQL.
+        texto = str(bruto)
+        if texto.startswith("c:"):
+            digito = texto[2:]
+            if digito.isdigit():
+                ids_cartao.append(int(digito))
+        elif texto.isdigit():
+            ids_lancamento.append(int(texto))
+
     conn = get_db()
     try:
         casa_id = minha_casa_id(conn)
+        # Compra de cartão não tem como ser "transferência" nem "fora dos
+        # totais": sem categoria, não há o que gravar. Falhar é melhor que
+        # um sucesso que não mudou nada.
+        if ids_cartao and not ids_lancamento and not categoria:
+            return jsonify({"erro": msg(
+                "compra de cartão só aceita categoria")}), 400
+        proprios = []
         # Só mexe no que é da casa: o id vem da tela e não pode ser confiado.
-        marcadores = ",".join("?" for _ in ids)
-        proprios = [r["id"] for r in conn.execute(
-            f"SELECT l.id FROM lancamentos l JOIN usuarios u ON u.id = l.usuario_id "
-            f"WHERE u.casa_id = ? AND l.id IN ({marcadores})",
-            [casa_id] + list(ids)).fetchall()]
+        if ids_lancamento:
+            marcadores = ",".join("?" for _ in ids_lancamento)
+            proprios += [r["id"] for r in conn.execute(
+                f"SELECT l.id FROM lancamentos l JOIN usuarios u ON u.id = l.usuario_id "
+                f"WHERE u.casa_id = ? AND l.id IN ({marcadores})",
+                [casa_id] + ids_lancamento).fetchall()]
+        if ids_cartao:
+            marcadores = ",".join("?" for _ in ids_cartao)
+            proprios += [r["id"] for r in conn.execute(
+                f"SELECT ct.id FROM cartao_transacoes ct "
+                f"JOIN usuarios u ON u.id = ct.usuario_id "
+                f"WHERE u.casa_id = ? AND ct.id IN ({marcadores})",
+                [casa_id] + ids_cartao).fetchall()]
         if not proprios:
             return jsonify({"erro": msg("nenhum desses lançamentos é desta casa")}), 404
 
-        marcadores2 = ",".join("?" for _ in proprios)
-        conn.execute(
-            f"UPDATE lancamentos SET categoria = COALESCE(?, categoria), "
-            f"eh_transferencia = ?, fora_dos_totais = ? WHERE id IN ({marcadores2})",
-            [categoria or None, int(transferencia), int(fora_dos_totais)] + proprios)
+        if ids_lancamento:
+            marcadores2 = ",".join("?" for _ in ids_lancamento)
+            alvos = [r["id"] for r in conn.execute(
+                f"SELECT l.id FROM lancamentos l JOIN usuarios u ON u.id = l.usuario_id "
+                f"WHERE u.casa_id = ? AND l.id IN ({marcadores2})",
+                [casa_id] + ids_lancamento).fetchall()]
+            if alvos:
+                marcadores3 = ",".join("?" for _ in alvos)
+                # A marca só é ligada, nunca desligada — o mesmo cuidado da
+                # regra no histórico. Escolher categoria para um grupo não
+                # significa "desmarque o que a pessoa marcou antes": a marca é
+                # dinheiro de terceiro, decisão dela, e sumir da lista ela
+                # desmarca por item.
+                conn.execute(
+                    f"UPDATE lancamentos SET categoria = COALESCE(?, categoria), "
+                    f"eh_transferencia = CASE WHEN ? THEN 1 ELSE eh_transferencia END, "
+                    f"fora_dos_totais = CASE WHEN ? THEN 1 ELSE fora_dos_totais END "
+                    f"WHERE id IN ({marcadores3})",
+                    [categoria or None, int(transferencia), int(fora_dos_totais)] + alvos)
+        if ids_cartao:
+            marcadores2 = ",".join("?" for _ in ids_cartao)
+            alvos = [r["id"] for r in conn.execute(
+                f"SELECT ct.id FROM cartao_transacoes ct "
+                f"JOIN usuarios u ON u.id = ct.usuario_id "
+                f"WHERE u.casa_id = ? AND ct.id IN ({marcadores2})",
+                [casa_id] + ids_cartao).fetchall()]
+            if alvos:
+                marcadores3 = ",".join("?" for _ in alvos)
+                conn.execute(
+                    f"UPDATE cartao_transacoes SET categoria = COALESCE(?, categoria) "
+                    f"WHERE id IN ({marcadores3})",
+                    [categoria or None] + alvos)
 
         regra_id = None
         if criar_regra and condicao:
